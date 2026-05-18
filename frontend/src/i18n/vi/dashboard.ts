@@ -1214,6 +1214,4 @@ export default {
   'diagnosis_rate_limited': 'Đã vượt giới hạn tốc độ. Thử lại sau.',
   'diagnosis_network': 'Không thể truy cập mạng. Kiểm tra URL và tường lửa.',
   'diagnosis_unknown': 'Lỗi không xác định. Xem chi tiết bên dưới.',
-  'preset_notes_deepseek': 'Endpoint Anthropic-compat chính thức của DeepSeek; cần API key sk-.',
-  'preset_notes_xiaomi_mimo': 'Xiaomi MiMo chỉ chấp nhận tên model đã biết; không có danh sách model công khai.',
 } satisfies Record<keyof typeof enDashboard, string>;

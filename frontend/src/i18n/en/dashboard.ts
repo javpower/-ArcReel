@@ -1217,6 +1217,4 @@ export default {
   'diagnosis_rate_limited': 'Rate limited. Try again later.',
   'diagnosis_network': 'Network unreachable. Check URL and firewall.',
   'diagnosis_unknown': 'Unknown error. See raw response.',
-  'preset_notes_deepseek': 'DeepSeek official Anthropic-compat endpoint; needs sk- prefixed key.',
-  'preset_notes_xiaomi_mimo': 'Xiaomi MiMo only accepts known model names; no public model list.',
 };

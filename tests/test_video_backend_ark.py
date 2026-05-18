@@ -401,6 +401,17 @@ class TestArkModelCapabilities:
         caps = b.capabilities
         assert VideoCapability.FLEX_TIER in caps
 
+    def test_seedance_2_dot_format_no_flex_tier(self):
+        """ark-agent-plan 用 dot 命名（doubao-seedance-2.0），同样不该带 FLEX_TIER。"""
+        with patch("lib.video_backends.ark.create_ark_client", return_value=MagicMock()):
+            b = ArkVideoBackend(api_key="test", model="doubao-seedance-2.0")
+        assert VideoCapability.FLEX_TIER not in b.capabilities
+
+    def test_seedance_2_fast_dot_format_no_flex_tier(self):
+        with patch("lib.video_backends.ark.create_ark_client", return_value=MagicMock()):
+            b = ArkVideoBackend(api_key="test", model="doubao-seedance-2.0-fast")
+        assert VideoCapability.FLEX_TIER not in b.capabilities
+
 
 class TestArkServiceTierParam:
     """service_tier 只对声明了 FLEX_TIER 能力的模型传入，否则 API 会报错。"""
@@ -463,3 +474,18 @@ class TestArkServiceTierParam:
 
         create_kwargs = backend._client.content_generation.tasks.create.call_args.kwargs
         assert create_kwargs.get("service_tier") == "default"
+
+
+class TestArkVideoBackendBaseUrl:
+    def test_custom_base_url_passed_through(self):
+        with patch("lib.video_backends.ark.create_ark_client") as mock_create:
+            ArkVideoBackend(api_key="k", base_url="https://ark.cn-beijing.volces.com/api/plan/v3")
+            mock_create.assert_called_once_with(
+                api_key="k",
+                base_url="https://ark.cn-beijing.volces.com/api/plan/v3",
+            )
+
+    def test_default_base_url_is_none(self):
+        with patch("lib.video_backends.ark.create_ark_client") as mock_create:
+            ArkVideoBackend(api_key="k")
+            mock_create.assert_called_once_with(api_key="k", base_url=None)
