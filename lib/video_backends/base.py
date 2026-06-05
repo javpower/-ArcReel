@@ -146,6 +146,11 @@ class VideoGenerationRequest:
     start_image: Path | None = None
     end_image: Path | None = None  # For first_last mode
     reference_images: list[Path] | None = None  # For multi-reference mode
+    # 平行 URL 通道：供应商响应里携带的公网直链，按 index 与上面 *_image / reference_images 对齐。
+    # 非空时 backend 优先用 url（直接喂下游），省掉一次本地→公网的上传。
+    start_image_url: str | None = None
+    end_image_url: str | None = None
+    reference_image_urls: list[str | None] | None = None
     generate_audio: bool = True
 
     # 项目上下文（用于构建文件服务 URL 等）

@@ -515,3 +515,87 @@ class TestModeGating:
             assert excinfo.value.code == "image_endpoint_mismatch_no_i2i"
             assert excinfo.value.params.get("model") == "m"
             assert excinfo.value.params.get("detail") == "all reference images failed to open"
+
+
+# ----- 回归：ReferenceImage.url 短路上传 + image_uri 透传 -----
+
+
+class TestAgnesImageEditUrlShortCircuit:
+    """``ReferenceImage.url`` 命中时跳过本地上传，直接喂下游；并把供应商返回的 url 写到 image_uri。"""
+
+    async def test_reference_url_skips_upload(self, monkeypatch, tmp_path: Path):
+        b64_data = base64.b64encode(b"edited").decode()
+        mock_client = AsyncMock()
+        mock_client.images.generate = AsyncMock(
+            return_value=_make_mock_image_response(
+                b64_data,
+                url="https://files.example.com/agnes/output.png",
+            )
+        )
+
+        ref_path = tmp_path / "ref.png"
+        ref_path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 10)
+
+        # 上传桩：ReferenceImage.url 命中时不应被调用
+        # 整模块替换 upload_to_tmpfiles：image backend 不再 import 它，但只要任何代码
+        # 路径（无论 image / video / 别的）走到 upload，这个桩会直接 fail，让回归
+        # 「image backend 绕过 upload」在重构时也能被守住。
+        async def _stub(_path):
+            raise AssertionError(f"upload_to_tmpfiles 不应被 image backend 调用（ref.url 已短路），但收到 path={_path}")
+
+        monkeypatch.setattr("lib.asset_upload.upload_to_tmpfiles", _stub)
+
+        with patch("lib.openai_shared.AsyncOpenAI", return_value=mock_client):
+            from lib.image_backends.openai import OpenAIImageBackend
+
+            backend = OpenAIImageBackend(api_key="k", model="agnes-image-1")
+            request = ImageGenerationRequest(
+                prompt="Edit",
+                output_path=tmp_path / "out.png",
+                reference_images=[
+                    ReferenceImage(path=str(ref_path), url="https://files.example.com/agnes/ref.png"),
+                ],
+            )
+            result = await backend.generate(request)
+
+        # 调用成功即证明 upload 未被触发（_stub 会抛 AssertionError）
+        call_kwargs = mock_client.images.generate.call_args[1]
+        assert call_kwargs["extra_body"]["image"] == ["https://files.example.com/agnes/ref.png"]
+        # 关键：不要传 response_format。OpenAI 兼容网关（agnes / ark / GPT Image 族）
+        # 不支持该参数，传了会 400。
+        assert "response_format" not in call_kwargs["extra_body"]
+        # 供应商响应里的 url 透传到 image_uri
+        assert result.image_uri == "https://files.example.com/agnes/output.png"
+
+    async def test_image_uri_captured_when_url_present(self, tmp_path: Path):
+        """供应商返回 url 时，_save_and_return 应把 url 写进 ImageGenerationResult.image_uri。"""
+        mock_client = AsyncMock()
+        mock_client.images.generate = AsyncMock(
+            return_value=_make_mock_image_response(
+                base64.b64encode(b"png").decode(),
+                url="https://files.example.com/agnes/x.png",
+            )
+        )
+        with patch("lib.openai_shared.AsyncOpenAI", return_value=mock_client):
+            from lib.image_backends.openai import OpenAIImageBackend
+
+            backend = OpenAIImageBackend(api_key="k", model="agnes-image-1")
+            request = ImageGenerationRequest(prompt="x", output_path=tmp_path / "out.png")
+            result = await backend.generate(request)
+
+        assert result.image_uri == "https://files.example.com/agnes/x.png"
+
+    async def test_image_uri_none_when_url_missing(self, tmp_path: Path):
+        """供应商响应无 url 时，image_uri 为 None。"""
+        mock_client = AsyncMock()
+        mock_client.images.generate = AsyncMock(
+            return_value=_make_mock_image_response(b64_data=base64.b64encode(b"png").decode(), url=None)
+        )
+        with patch("lib.openai_shared.AsyncOpenAI", return_value=mock_client):
+            from lib.image_backends.openai import OpenAIImageBackend
+
+            backend = OpenAIImageBackend(api_key="k", model="agnes-image-1")
+            request = ImageGenerationRequest(prompt="x", output_path=tmp_path / "out.png")
+            result = await backend.generate(request)
+
+        assert result.image_uri is None

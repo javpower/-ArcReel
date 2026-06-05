@@ -120,7 +120,7 @@ class MediaGenerator:
         aspect_ratio: str = "9:16",
         image_size: str | None = None,
         **version_metadata,
-    ) -> tuple[Path, int]:
+    ) -> tuple[Path, int, str | None]:
         """
         生成图片（带自动版本管理，同步包装）
 
@@ -134,7 +134,7 @@ class MediaGenerator:
             **version_metadata: 额外元数据
 
         Returns:
-            (output_path, version_number) 元组
+            (output_path, version_number, image_uri) 元组，参见 ``generate_image_async``。
         """
         return self._sync(
             self.generate_image_async(
@@ -157,7 +157,7 @@ class MediaGenerator:
         aspect_ratio: str = "9:16",
         image_size: str | None = None,
         **version_metadata,
-    ) -> tuple[Path, int]:
+    ) -> tuple[Path, int, str | None]:
         """
         异步生成图片（带自动版本管理）
 
@@ -171,7 +171,9 @@ class MediaGenerator:
             **version_metadata: 额外元数据
 
         Returns:
-            (output_path, version_number) 元组
+            (output_path, version_number, image_uri) 元组。``image_uri`` 是
+            供应商响应里附带的公网直链（典型为 agnes 系列的 ``item.url``），调用方
+            负责写回 project.json 供下游跨进程复用，省掉本地上传。
         """
         from lib.image_backends.base import ImageGenerationRequest, ReferenceImage
 
@@ -200,12 +202,16 @@ class MediaGenerator:
         ref_images: list[ReferenceImage] = []
         if reference_images:
             for ref in reference_images:
-                if isinstance(ref, dict):
+                if isinstance(ref, ReferenceImage):
+                    # 已是规范对象（含 url），直接透传
+                    ref_images.append(ref)
+                elif isinstance(ref, dict):
                     img_val = ref.get("image", "")
                     ref_images.append(
                         ReferenceImage(
                             path=str(img_val),
                             label=str(ref.get("label", "")),
+                            url=ref.get("url"),
                         )
                     )
                 elif hasattr(ref, "__fspath__") or isinstance(ref, (str, Path)):
@@ -280,7 +286,7 @@ class MediaGenerator:
             **version_metadata,
         )
 
-        return output_path, new_version
+        return output_path, new_version, getattr(result, "image_uri", None)
 
     def generate_video(
         self,
@@ -339,6 +345,9 @@ class MediaGenerator:
         aspect_ratio: str = "9:16",
         duration_seconds: str | int = "8",
         resolution: str | None = None,
+        start_image_url: str | None = None,
+        end_image_url: str | None = None,
+        reference_image_urls: list[str | None] | None = None,
         **version_metadata,
     ) -> tuple[Path, int, Any, str | None]:
         """
@@ -354,6 +363,10 @@ class MediaGenerator:
             aspect_ratio: 宽高比，默认 9:16（竖屏）
             duration_seconds: 视频时长，可选 "4", "6", "8"
             resolution: 分辨率，默认不传（由 backend/SDK 决定）
+            start_image_url: 起始帧对应的公网直链（与 start_image 按位置对齐），
+                非空时 backend 优先用它喂下游，省掉一次本地上传。
+            end_image_url: 同上，针对 end_image。
+            reference_image_urls: 同上，按 index 与 reference_images 对齐。
             **version_metadata: 额外元数据
 
         Returns:
@@ -412,6 +425,9 @@ class MediaGenerator:
             # Three-level fallback based on backend video capabilities
             actual_end_image = None
             actual_reference_images = reference_images
+            actual_reference_image_urls: list[str | None] | None = (
+                list(reference_image_urls) if reference_image_urls else None
+            )
 
             if end_image and self._video_backend:
                 caps = self._video_backend.video_capabilities
@@ -420,6 +436,10 @@ class MediaGenerator:
                 elif caps.reference_images:
                     # Fallback: pass end_image as reference image
                     actual_reference_images = (actual_reference_images or []) + [end_image]
+                    # end_image 没有对应的远端 url（只有 start_image 通常来自 agnes storyboard
+                    # 持久化的 url），占位 None 让 backend 走本地上传
+                    if actual_reference_image_urls is not None:
+                        actual_reference_image_urls.append(None)
                     logger.info(
                         "Video backend %s does not support last_frame, falling back to reference_images",
                         self._video_backend.name,
@@ -439,6 +459,9 @@ class MediaGenerator:
                 start_image=Path(start_image) if isinstance(start_image, (str, Path)) else None,
                 end_image=actual_end_image,
                 reference_images=actual_reference_images,
+                start_image_url=start_image_url,
+                end_image_url=end_image_url,
+                reference_image_urls=actual_reference_image_urls,
                 generate_audio=effective_generate_audio,
                 project_name=self.project_name,
                 service_tier=version_metadata.get("service_tier", "default"),

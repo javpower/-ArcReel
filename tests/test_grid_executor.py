@@ -195,7 +195,7 @@ class TestExecuteGridTask:
         fake_grid_image.save(grid_image_path, format="PNG")
 
         mock_generator = MagicMock()
-        mock_generator.generate_image_async = AsyncMock(return_value=(grid_image_path, 1))
+        mock_generator.generate_image_async = AsyncMock(return_value=(grid_image_path, 1, None))
 
         with (
             patch("server.services.generation_tasks.get_project_manager") as mock_pm_fn,
@@ -244,7 +244,7 @@ class TestExecuteGridTask:
         fake_grid_image.save(grid_image_path, format="PNG")
 
         mock_generator = MagicMock()
-        mock_generator.generate_image_async = AsyncMock(return_value=(grid_image_path, 1))
+        mock_generator.generate_image_async = AsyncMock(return_value=(grid_image_path, 1, None))
 
         with (
             patch("server.services.generation_tasks.get_project_manager") as mock_pm_fn,
@@ -347,7 +347,7 @@ class TestGridMetadataT2II2ISlotSelection:
         fake_grid_image.save(grid_image_path, format="PNG")
 
         mock_generator = MagicMock()
-        mock_generator.generate_image_async = AsyncMock(return_value=(grid_image_path, 1))
+        mock_generator.generate_image_async = AsyncMock(return_value=(grid_image_path, 1, None))
 
         with (
             patch("server.services.generation_tasks.get_project_manager") as mock_pm_fn,

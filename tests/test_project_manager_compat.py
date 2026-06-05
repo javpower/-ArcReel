@@ -92,3 +92,65 @@ class TestProjectManagerCompatibility:
         assert segment["generated_assets"]["video_clip"] is None
         assert segment["generated_assets"]["status"] == "storyboard_ready"
         assert "metadata" in updated
+
+    def test_update_scene_asset_writes_url_alongside_path(self, pm_env):
+        """asset_url 应同步写入 generated_assets[asset_type + '_url']，供下游 backend 跨进程复用。"""
+        pm, project_name = pm_env
+        raw_script = {
+            "title": "Episode 1",
+            "content_mode": "narration",
+            "segments": [{"segment_id": "E1S01", "duration_seconds": 6}],
+        }
+        _script_path(pm, project_name, "episode_1.json").write_text(
+            json.dumps(raw_script, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        pm.update_scene_asset(
+            project_name=project_name,
+            script_filename="episode_1.json",
+            scene_id="E1S01",
+            asset_type="storyboard_image",
+            asset_path="storyboards/scene_E1S01.png",
+            asset_url="https://files.example.com/agnes/scene_E1S01.png",
+        )
+
+        updated = pm.load_script(project_name, "episode_1.json")
+        assets = updated["segments"][0]["generated_assets"]
+        assert assets["storyboard_image"] == "storyboards/scene_E1S01.png"
+        assert assets["storyboard_image_url"] == "https://files.example.com/agnes/scene_E1S01.png"
+
+    def test_update_scene_asset_without_url_keeps_existing_url_untouched(self, pm_env):
+        """asset_url 缺省时不覆盖已存在的 *_url 字段（允许外部只更新 path）。"""
+        pm, project_name = pm_env
+        raw_script = {
+            "title": "Episode 1",
+            "content_mode": "narration",
+            "segments": [
+                {
+                    "segment_id": "E1S01",
+                    "duration_seconds": 6,
+                    "generated_assets": {
+                        "storyboard_image_url": "https://files.example.com/old.png",
+                    },
+                }
+            ],
+        }
+        _script_path(pm, project_name, "episode_1.json").write_text(
+            json.dumps(raw_script, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        pm.update_scene_asset(
+            project_name=project_name,
+            script_filename="episode_1.json",
+            scene_id="E1S01",
+            asset_type="storyboard_image",
+            asset_path="storyboards/scene_E1S01.png",
+        )
+
+        updated = pm.load_script(project_name, "episode_1.json")
+        assets = updated["segments"][0]["generated_assets"]
+        assert assets["storyboard_image"] == "storyboards/scene_E1S01.png"
+        # url 未在本次调用中传，旧值保留
+        assert assets["storyboard_image_url"] == "https://files.example.com/old.png"

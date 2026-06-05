@@ -803,14 +803,22 @@ class ProjectManager:
 
     # ==================== 角色管理 ====================
 
-    def update_character_sheet(self, project_name: str, script_filename: str, name: str, sheet_path: str) -> dict:
-        """更新角色设计图路径"""
+    def update_character_sheet(
+        self, project_name: str, script_filename: str, name: str, sheet_path: str, sheet_url: str | None = None
+    ) -> dict:
+        """更新角色设计图路径
+
+        ``sheet_url`` 同步写入 ``character_sheet_url`` 字段，供下游 backend
+        跨进程复用公网直链（避免本地上传）。
+        """
         # 资产回写热路径：只动运行时字段，结构不可能因此变坏，豁免结构校验。
         with self.locked_script(project_name, script_filename, validate=False) as script:
             if name not in script["characters"]:
                 # 在锁内抛出，locked_script 跳过写回
                 raise KeyError(f"角色 '{name}' 不存在")
             script["characters"][name]["character_sheet"] = sheet_path
+            if sheet_url is not None:
+                script["characters"][name]["character_sheet_url"] = sheet_url
         return script
 
     # ==================== 数据结构标准化 ====================
@@ -828,7 +836,9 @@ class ProjectManager:
         """
         return {
             "storyboard_image": None,
+            "storyboard_image_url": None,
             "storyboard_last_image": None,
+            "storyboard_last_image_url": None,
             "video_clip": None,
             "video_thumbnail": None,
             "video_uri": None,
@@ -1075,6 +1085,7 @@ class ProjectManager:
         scene_id: str,
         asset_type: str,
         asset_path: str,
+        asset_url: str | None = None,
     ) -> dict:
         """
         更新场景的生成资源路径
@@ -1085,6 +1096,8 @@ class ProjectManager:
             scene_id: 场景/片段 ID
             asset_type: 资源类型 ('storyboard_image' 或 'video_clip')
             asset_path: 资源路径
+            asset_url: 资源对应的公网直链（如供应商返回的 url），便于下游 backend
+                跨进程复用，省掉一次本地上传。存到 ``generated_assets[asset_type + "_url"]``。
 
         Returns:
             更新后的剧本
@@ -1110,6 +1123,9 @@ class ProjectManager:
                             assets[key] = default_value
 
                     assets[asset_type] = asset_path
+                    if asset_url is not None:
+                        # 与 asset_type 平行的 _url 字段，由 create_generated_assets 兜底
+                        assets[f"{asset_type}_url"] = asset_url
 
                     # 使用 update_scene_status 更新状态
                     self.update_scene_status(item)
@@ -1123,14 +1139,17 @@ class ProjectManager:
         self,
         project_name: str,
         script_filename: str,
-        updates: list[tuple[str, str, Any]],
+        updates: list[tuple[str, str, Any, str | None]] | list[tuple[str, str, Any]],
     ) -> dict:
         """批量更新多个场景的生成资源路径（单次读写）。
 
         Args:
             project_name: 项目名称
             script_filename: 剧本文件名
-            updates: 列表，每项为 (scene_id, asset_type, asset_path)
+            updates: 列表，每项为 ``(scene_id, asset_type, asset_path)`` 或
+                ``(scene_id, asset_type, asset_path, asset_url)``。传 ``asset_url``
+                时同步写 ``generated_assets[asset_type + "_url"]``，供下游 backend
+                跨进程复用公网直链。
 
         Returns:
             更新后的剧本
@@ -1148,7 +1167,12 @@ class ProjectManager:
             # 建立 scene_id → item 索引，避免 O(N*M) 查找
             item_by_id: dict[str, dict] = {str(item.get(id_field)): item for item in items}
 
-            for scene_id, asset_type, asset_path in updates:
+            for entry in updates:
+                if len(entry) == 4:
+                    scene_id, asset_type, asset_path, asset_url = entry
+                else:
+                    scene_id, asset_type, asset_path = entry
+                    asset_url = None
                 item = item_by_id.get(str(scene_id))
                 if item is None:
                     continue
@@ -1164,6 +1188,8 @@ class ProjectManager:
                         assets[key] = default_value
 
                 assets[asset_type] = asset_path
+                if asset_url is not None:
+                    assets[f"{asset_type}_url"] = asset_url
                 self.update_scene_status(item)
         return script
 
@@ -1586,8 +1612,13 @@ class ProjectManager:
             self.update_project(project_name, _mutate)
         return added
 
-    def _update_asset_sheet(self, asset_type: str, project_name: str, name: str, sheet_path: str) -> dict:
+    def _update_asset_sheet(
+        self, asset_type: str, project_name: str, name: str, sheet_path: str, sheet_url: str | None = None
+    ) -> dict:
         """更新资产 sheet 字段路径。资产不存在抛 KeyError。
+
+        ``sheet_url`` 同步写入 ``<sheet_field>_url`` 字段（如 ``scene_sheet_url`` /
+        ``prop_sheet_url``），供下游 backend 跨进程复用公网直链。
 
         通过 update_project 在单一文件锁内完成 read-modify-write，避免与并发 add /
         update 任务的 lost-update 竞态。
@@ -1599,6 +1630,8 @@ class ProjectManager:
             if bucket is None or name not in bucket:
                 raise KeyError(f"{spec.label_zh} '{name}' 不存在")
             bucket[name][spec.sheet_field] = sheet_path
+            if sheet_url is not None:
+                bucket[name][f"{spec.sheet_field}_url"] = sheet_url
 
         return self.update_project(project_name, _mutate)
 
@@ -1661,9 +1694,11 @@ class ProjectManager:
 
         return self.update_project(project_name, _mutate)
 
-    def update_project_character_sheet(self, project_name: str, name: str, sheet_path: str) -> dict:
-        """更新项目级角色设计图路径"""
-        return self._update_asset_sheet("character", project_name, name, sheet_path)
+    def update_project_character_sheet(
+        self, project_name: str, name: str, sheet_path: str, sheet_url: str | None = None
+    ) -> dict:
+        """更新项目级角色设计图路径。``sheet_url`` 同步写入 ``character_sheet_url``。"""
+        return self._update_asset_sheet("character", project_name, name, sheet_path, sheet_url=sheet_url)
 
     def update_character_reference_image(self, project_name: str, char_name: str, ref_path: str) -> dict:
         """
@@ -1691,9 +1726,9 @@ class ProjectManager:
 
     # ==================== 场景管理（scene） ====================
 
-    def update_scene_sheet(self, project_name: str, name: str, sheet_path: str) -> dict:
-        """更新场景设计图路径"""
-        return self._update_asset_sheet("scene", project_name, name, sheet_path)
+    def update_scene_sheet(self, project_name: str, name: str, sheet_path: str, sheet_url: str | None = None) -> dict:
+        """更新场景设计图路径。``sheet_url`` 同步写入 ``scene_sheet_url``。"""
+        return self._update_asset_sheet("scene", project_name, name, sheet_path, sheet_url=sheet_url)
 
     def get_scene(self, project_name: str, name: str) -> dict:
         """获取场景定义"""
@@ -1709,9 +1744,9 @@ class ProjectManager:
 
     # ==================== 道具管理（prop） ====================
 
-    def update_prop_sheet(self, project_name: str, name: str, sheet_path: str) -> dict:
-        """更新道具设计图路径"""
-        return self._update_asset_sheet("prop", project_name, name, sheet_path)
+    def update_prop_sheet(self, project_name: str, name: str, sheet_path: str, sheet_url: str | None = None) -> dict:
+        """更新道具设计图路径。``sheet_url`` 同步写入 ``prop_sheet_url``。"""
+        return self._update_asset_sheet("prop", project_name, name, sheet_path, sheet_url=sheet_url)
 
     def get_prop(self, project_name: str, name: str) -> dict:
         """获取道具定义"""

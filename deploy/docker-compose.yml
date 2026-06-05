@@ -1,7 +1,10 @@
 services:
   arcreel:
-    image: ghcr.io/arcreel/arcreel:latest
-    # build: ../  # 本地构建时取消注释，注释掉 image 行
+    # image: ghcr.io/arcreel/arcreel:latest  # 本地构建时注释掉 image 行
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: arcreel:local
     ports:
       - "1241:1241"
     env_file: .env

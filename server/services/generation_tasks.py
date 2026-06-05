@@ -20,7 +20,7 @@ from lib.db.base import DEFAULT_USER_ID
 from lib.gemini_shared import get_shared_rate_limiter
 from lib.i18n import DEFAULT_LOCALE
 from lib.i18n import _ as i18n_translate
-from lib.image_backends.base import ImageCapabilityError
+from lib.image_backends.base import ImageCapabilityError, ReferenceImage
 from lib.media_generator import MediaGenerator
 from lib.project_change_hints import emit_project_change_batch, project_change_source
 from lib.project_manager import ProjectManager
@@ -480,14 +480,17 @@ def _collect_sheet_paths(
     scene_field: str,
     prop_field: str,
     max_count: int = 0,
-) -> tuple[list[Path], set[str]]:
+) -> tuple[list[tuple[Path, str | None]], set[str]]:
     """Collect character_sheet, scene_sheet and prop_sheet paths from scene/segment items.
 
-    Returns (list of existing Paths, set of relative sheet strings for dedup).
+    Returns (list of (existing Path, optional cached url), set of relative sheet strings for dedup).
+    ``url`` 来自 project.json 的 ``*_sheet_url`` 字段（由上次 agnes 生成的公网直链回写），
+    下游 backend 优先用它喂 agnes，省掉一次本地上传。
+
     If *max_count* > 0 collection stops after that many images.
     """
     seen: set[str] = set()
-    paths: list[Path] = []
+    paths: list[tuple[Path, str | None]] = []
 
     characters = project.get("characters", {})
     project_scenes = project.get("scenes", {})
@@ -495,25 +498,28 @@ def _collect_sheet_paths(
 
     for item in items:
         for char_name in item.get(char_field, []):
-            sheet = characters.get(char_name, {}).get("character_sheet")
+            entry = characters.get(char_name) or {}
+            sheet = entry.get("character_sheet")
             if sheet and sheet not in seen:
                 path = project_path / sheet
                 if path.exists():
-                    paths.append(path)
+                    paths.append((path, entry.get("character_sheet_url")))
                     seen.add(sheet)
         for scene_name in item.get(scene_field, []):
-            sheet = project_scenes.get(scene_name, {}).get("scene_sheet")
+            entry = project_scenes.get(scene_name) or {}
+            sheet = entry.get("scene_sheet")
             if sheet and sheet not in seen:
                 path = project_path / sheet
                 if path.exists():
-                    paths.append(path)
+                    paths.append((path, entry.get("scene_sheet_url")))
                     seen.add(sheet)
         for prop_name in item.get(prop_field, []):
-            sheet = project_props.get(prop_name, {}).get("prop_sheet")
+            entry = project_props.get(prop_name) or {}
+            sheet = entry.get("prop_sheet")
             if sheet and sheet not in seen:
                 path = project_path / sheet
                 if path.exists():
-                    paths.append(path)
+                    paths.append((path, entry.get("prop_sheet_url")))
                     seen.add(sheet)
         if max_count and len(paths) >= max_count:
             break
@@ -532,10 +538,11 @@ def _collect_reference_images(
     extra_reference_images: list[str] | None = None,
     previous_storyboard_path: Path | None = None,
 ) -> list[object] | None:
-    sheet_paths, _ = _collect_sheet_paths(
+    sheet_entries, _ = _collect_sheet_paths(
         project, project_path, [target_item], char_field=char_field, scene_field=scene_field, prop_field=prop_field
     )
-    reference_images: list[object] = list(sheet_paths)
+    # sheet 来源：直接以 ReferenceImage 形式产出，url 透传到 backend
+    reference_images: list[object] = [ReferenceImage(path=str(path), url=url) for path, url in sheet_entries]
 
     for extra in extra_reference_images or []:
         extra_path = Path(extra)
@@ -743,7 +750,7 @@ async def execute_storyboard_task(
     resolved_image = await _resolve_effective_image_backend(project, payload, needs_i2i=_needs_i2i)
     image_size = await resolve_resolution(project, resolved_image.provider_id, resolved_image.model_id)
 
-    _, version = await generator.generate_image_async(
+    _, version, storyboard_image_url = await generator.generate_image_async(
         prompt=prompt_text,
         resource_type="storyboards",
         resource_id=resource_id,
@@ -759,6 +766,7 @@ async def execute_storyboard_task(
             scene_id=resource_id,
             asset_type="storyboard_image",
             asset_path=f"storyboards/scene_{resource_id}.png",
+            asset_url=storyboard_image_url,
         )
         return generator.versions.get_versions("storyboards", resource_id)["versions"][-1]["created_at"]
 
@@ -792,9 +800,9 @@ async def execute_video_task(
         _items, _id_field, _, _, _ = get_storyboard_items(_script)
         _resolved = find_storyboard_item(_items, _id_field, resource_id)
         _item = _resolved[0] if _resolved else {}
-        return _project, _project_path, _item
+        return _project, _project_path, _item, _items, _id_field
 
-    project, project_path, item = await asyncio.to_thread(_load)
+    project, project_path, item, items, id_field = await asyncio.to_thread(_load)
     generator = await get_media_generator(project_name, payload=payload, user_id=user_id)
 
     # 优先读取 generated_assets.storyboard_image，回退默认路径。
@@ -807,6 +815,10 @@ async def execute_video_task(
         storyboard_file = project_path / "storyboards" / f"scene_{resource_id}.png"
     if not storyboard_file.exists():
         raise ValueError(f"storyboard not found: {storyboard_file.name}")
+
+    # storyboard 之前由 agnes 生成时保留的公网直链（项目内字段），下游 agnes video
+    # 优先用它喂 start_image，省掉一次本地上传。缺位回退到 path 走 fallback 上传。
+    storyboard_url = assets.get("storyboard_image_url") if isinstance(assets, dict) else None
 
     prompt_text = _normalize_video_prompt(prompt)
     aspect_ratio = get_aspect_ratio(project, "videos")
@@ -859,14 +871,43 @@ async def execute_video_task(
     # 此处不预先 int() 截断，避免把非整数秒静默修正成「碰巧合法」的值。
     assert_duration_supported(duration_seconds, supported_durations)
 
-    end_image = None  # 宫格模式不再使用首尾帧，统一走普通图生视频
+    # 查找下一个镜头的分镜图作为 end_image（首尾帧 keyframes 模式）。
+    # 仅当后端支持 last_frame 且下一镜头已有分镜图时才启用；
+    # 最后一个镜头、跨集/跨段（segment_break）、或下一镜头尚未生成分镜时回退到单图模式。
+    end_image: Path | None = None
+    end_image_url: str | None = None
+    # 检查后端是否支持首尾帧：先拿 generator 的 video_backend（可能被 custom_provider 包装）
+    _vb = getattr(generator, "_video_backend", None)
+    # custom_provider.BackendWrapper 代理了 video_capabilities
+    _caps = getattr(_vb, "video_capabilities", None) if _vb else None
+    if _caps and getattr(_caps, "last_frame", False):
+        # 在 items 列表中找到当前 item 的 index，取下一个
+        _cur_idx: int = -1
+        for _i, _it in enumerate(items):
+            if _it.get(id_field) == resource_id:
+                _cur_idx = _i
+                break
+        if _cur_idx >= 0 and _cur_idx + 1 < len(items):
+            _next_item = items[_cur_idx + 1]
+            # 下一镜头是新一集/新段落的开始 → 不衔接
+            if not _next_item.get("segment_break"):
+                _next_assets = _next_item.get("generated_assets", {})
+                if isinstance(_next_assets, dict):
+                    _next_sb_rel = _next_assets.get("storyboard_image")
+                    if _next_sb_rel:
+                        _next_sb_path = project_path / _next_sb_rel
+                        if _next_sb_path.exists():
+                            end_image = _next_sb_path
+                            end_image_url = _next_assets.get("storyboard_image_url")
 
     _, version, _, video_uri = await generator.generate_video_async(
         prompt=prompt_text,
         resource_type="videos",
         resource_id=resource_id,
         start_image=storyboard_file,
+        start_image_url=storyboard_url,
         end_image=end_image,
+        end_image_url=end_image_url,
         aspect_ratio=aspect_ratio,
         duration_seconds=duration_seconds,
         resolution=resolution,
@@ -955,7 +996,7 @@ async def execute_character_task(
     resolved_image = await _resolve_effective_image_backend(project, payload, needs_i2i=_needs_i2i)
     image_size = await resolve_resolution(project, resolved_image.provider_id, resolved_image.model_id)
 
-    _, version = await generator.generate_image_async(
+    _, version, character_sheet_url = await generator.generate_image_async(
         prompt=full_prompt,
         resource_type="characters",
         resource_id=resource_id,
@@ -969,6 +1010,8 @@ async def execute_character_task(
     def _finalize_char():
         def _set_character_sheet(p: dict) -> None:
             p["characters"][resource_id]["character_sheet"] = sheet_path
+            if character_sheet_url:
+                p["characters"][resource_id]["character_sheet_url"] = character_sheet_url
 
         get_project_manager().update_project(project_name, _set_character_sheet)
         return generator.versions.get_versions("characters", resource_id)["versions"][-1]["created_at"]
@@ -1026,7 +1069,7 @@ async def execute_design_task(
     resolved_image = await _resolve_effective_image_backend(project, payload, needs_i2i=False)
     image_size = await resolve_resolution(project, resolved_image.provider_id, resolved_image.model_id)
 
-    _, version = await generator.generate_image_async(
+    _, version, sheet_url = await generator.generate_image_async(
         prompt=full_prompt,
         resource_type=bucket_key,
         resource_id=resource_id,
@@ -1037,7 +1080,7 @@ async def execute_design_task(
     sheet_path = f"{bucket_key}/{resource_id}.png"
 
     def _finalize():
-        get_project_manager()._update_asset_sheet(kind, project_name, resource_id, sheet_path)
+        get_project_manager()._update_asset_sheet(kind, project_name, resource_id, sheet_path, sheet_url=sheet_url)
         return generator.versions.get_versions(bucket_key, resource_id)["versions"][-1]["created_at"]
 
     created_at = await asyncio.to_thread(_finalize)
@@ -1213,7 +1256,7 @@ async def execute_grid_task(
             await resolve_resolution(project, resolved_image.provider_id, resolved_image.model_id) or "2K"
         )  # 宫格图保底高分辨率
 
-        image_path, version = await generator.generate_image_async(
+        image_path, version, _grid_image_url = await generator.generate_image_async(
             prompt=prompt_text,
             resource_type="grids",
             resource_id=resource_id,

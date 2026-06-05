@@ -135,15 +135,25 @@ class _FakePM:
     def project_exists(self, project_name: str) -> bool:
         return True
 
-    def _update_asset_sheet(self, asset_type: str, project_name: str, name: str, sheet_path: str) -> dict:
+    def _update_asset_sheet(
+        self, asset_type: str, project_name: str, name: str, sheet_path: str, sheet_url: str | None = None
+    ) -> dict:
         from lib.asset_types import ASSET_SPECS
 
         spec = ASSET_SPECS[asset_type]
-        self.project.setdefault(spec.bucket_key, {}).setdefault(name, {})[spec.sheet_field] = sheet_path
+        entry = self.project.setdefault(spec.bucket_key, {}).setdefault(name, {})
+        entry[spec.sheet_field] = sheet_path
+        if sheet_url is not None:
+            entry[f"{spec.sheet_field}_url"] = sheet_url
         return self.project
 
-    def update_project_character_sheet(self, project_name: str, name: str, sheet_path: str) -> dict:
-        self.project.setdefault("characters", {}).setdefault(name, {})["character_sheet"] = sheet_path
+    def update_project_character_sheet(
+        self, project_name: str, name: str, sheet_path: str, sheet_url: str | None = None
+    ) -> dict:
+        entry = self.project.setdefault("characters", {}).setdefault(name, {})
+        entry["character_sheet"] = sheet_path
+        if sheet_url is not None:
+            entry["character_sheet_url"] = sheet_url
         return self.project
 
 
@@ -155,11 +165,11 @@ class _FakeGenerator:
 
     def generate_image(self, **kwargs):
         self.image_calls.append(kwargs)
-        return Path("/tmp/image.png"), 1
+        return Path("/tmp/image.png"), 1, None
 
     async def generate_image_async(self, **kwargs):
         self.image_calls.append(kwargs)
-        return Path("/tmp/image.png"), 1
+        return Path("/tmp/image.png"), 1, None
 
     def generate_video(self, **kwargs):
         self.video_calls.append(kwargs)
@@ -264,11 +274,14 @@ class TestGenerationTasks:
         )
         assert storyboard_result["resource_type"] == "storyboards"
         storyboard_refs = fake_generator.image_calls[0]["reference_images"]
+        # sheet 来源走 ReferenceImage 形式产出（透传 url），其余保持原样
+        from lib.image_backends.base import ReferenceImage
+
         assert storyboard_refs == [
-            project_path / "characters" / "Alice.png",
-            project_path / "scenes" / "祠堂.png",
-            project_path / "props" / "玉佩.png",
-            project_path / "characters" / "Alice.png",
+            ReferenceImage(path=str(project_path / "characters" / "Alice.png")),
+            ReferenceImage(path=str(project_path / "scenes" / "祠堂.png")),
+            ReferenceImage(path=str(project_path / "props" / "玉佩.png")),
+            project_path / "characters" / "Alice.png",  # extra_reference_images 走原 Path 形式
             {
                 "image": project_path / "storyboards" / "scene_E1S01.png",
                 "label": PREVIOUS_STORYBOARD_REFERENCE_LABEL,
@@ -282,9 +295,9 @@ class TestGenerationTasks:
             {"script_file": "episode_1.json", "prompt": "direct prompt"},
         )
         assert fake_generator.image_calls[1]["reference_images"] == [
-            project_path / "characters" / "Alice.png",
-            project_path / "scenes" / "祠堂.png",
-            project_path / "props" / "玉佩.png",
+            ReferenceImage(path=str(project_path / "characters" / "Alice.png")),
+            ReferenceImage(path=str(project_path / "scenes" / "祠堂.png")),
+            ReferenceImage(path=str(project_path / "props" / "玉佩.png")),
         ]
 
         video_result = await generation_tasks.execute_video_task(
@@ -740,3 +753,124 @@ class TestFillSimpleProviderKwargs:
         kwargs: dict = {}
         await generation_tasks._fill_simple_provider_kwargs("grok", resolver, kwargs, "m")
         assert "base_url" not in kwargs
+
+
+# ----- 回归：_collect_sheet_paths 透传 *_sheet_url -----
+# 这些测试不依赖具体 task 编排，只验证 _collect_sheet_paths / _collect_reference_images
+# 在 project.json 的 character_sheet_url / scene_sheet_url / prop_sheet_url 字段存在时
+# 把 url 透传到 ReferenceImage.url，供下游 agnes image edit 短路上传。
+
+
+class TestCollectSheetUrlPassthrough:
+    def _setup_project(self, project_path: Path) -> None:
+        project_path.mkdir(parents=True, exist_ok=True)
+        (project_path / "characters").mkdir(exist_ok=True)
+        (project_path / "scenes").mkdir(exist_ok=True)
+        (project_path / "props").mkdir(exist_ok=True)
+        (project_path / "characters" / "Alice.png").write_bytes(b"png")
+        (project_path / "scenes" / "hall.png").write_bytes(b"png")
+        (project_path / "props" / "jade.png").write_bytes(b"png")
+
+    def test_collect_sheet_paths_passes_url_from_project(self, tmp_path: Path):
+        project_path = tmp_path / "project"
+        self._setup_project(project_path)
+        project = {
+            "characters": {
+                "Alice": {
+                    "character_sheet": "characters/Alice.png",
+                    "character_sheet_url": "https://files.example.com/agnes/Alice.png",
+                }
+            },
+            "scenes": {},
+            "props": {},
+        }
+        items = [{"characters": ["Alice"]}]
+
+        paths, _ = generation_tasks._collect_sheet_paths(
+            project,
+            project_path,
+            items,
+            char_field="characters",
+            scene_field="scenes",
+            prop_field="props",
+        )
+
+        assert paths == [
+            (project_path / "characters" / "Alice.png", "https://files.example.com/agnes/Alice.png"),
+        ]
+
+    def test_collect_sheet_paths_url_none_when_missing(self, tmp_path: Path):
+        project_path = tmp_path / "project"
+        self._setup_project(project_path)
+        project = {
+            "characters": {"Alice": {"character_sheet": "characters/Alice.png"}},  # 无 _url
+            "scenes": {},
+            "props": {},
+        }
+        items = [{"characters": ["Alice"]}]
+
+        paths, _ = generation_tasks._collect_sheet_paths(
+            project,
+            project_path,
+            items,
+            char_field="characters",
+            scene_field="scenes",
+            prop_field="props",
+        )
+
+        assert paths == [(project_path / "characters" / "Alice.png", None)]
+
+    def test_collect_reference_images_propagates_url_to_referenceimage(self, tmp_path: Path):
+        project_path = tmp_path / "project"
+        self._setup_project(project_path)
+        project = {
+            "characters": {
+                "Alice": {
+                    "character_sheet": "characters/Alice.png",
+                    "character_sheet_url": "https://files.example.com/agnes/Alice.png",
+                }
+            },
+            "scenes": {
+                "hall": {
+                    "scene_sheet": "scenes/hall.png",
+                    "scene_sheet_url": "https://files.example.com/agnes/hall.png",
+                }
+            },
+            "props": {
+                "jade": {
+                    "prop_sheet": "props/jade.png",
+                    "prop_sheet_url": "https://files.example.com/agnes/jade.png",
+                }
+            },
+        }
+        target = {
+            "characters": ["Alice"],
+            "scenes": ["hall"],
+            "props": ["jade"],
+        }
+
+        refs = generation_tasks._collect_reference_images(
+            project,
+            project_path,
+            target,
+            char_field="characters",
+            scene_field="scenes",
+            prop_field="props",
+        )
+
+        assert refs is not None
+        from lib.image_backends.base import ReferenceImage
+
+        # 顺序：characters → scenes → props
+        assert refs[0] == ReferenceImage(
+            path=str(project_path / "characters" / "Alice.png"),
+            url="https://files.example.com/agnes/Alice.png",
+        )
+        assert refs[1] == ReferenceImage(
+            path=str(project_path / "scenes" / "hall.png"),
+            url="https://files.example.com/agnes/hall.png",
+        )
+        assert refs[2] == ReferenceImage(
+            path=str(project_path / "props" / "jade.png"),
+            url="https://files.example.com/agnes/jade.png",
+        )

@@ -73,6 +73,7 @@ class ReferenceImage:
 
     path: str
     label: str = ""
+    url: str | None = None  # 远端公网直链（供应商响应里的 url），优先于本地 path 上传
 
 
 @dataclass

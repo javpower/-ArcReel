@@ -762,3 +762,91 @@ def test_read_source_files_raises_on_non_utf8(tmp_path):
     with pytest.raises(SourceDecodeError) as exc_info:
         pm._read_source_files("demo")
     assert exc_info.value.filename == "broken.txt"
+
+
+class TestAssetSheetUrl:
+    """资产 sheet setter 接受 sheet_url 同步写入 ``*_sheet_url`` 字段。"""
+
+    def _make_pm(self, tmp_path):
+        pm = ProjectManager(tmp_path / "projects")
+        pm.create_project("demo")
+        pm.create_project_metadata("demo", "Demo")
+        return pm
+
+    def test_update_project_character_sheet_writes_url(self, tmp_path):
+        pm = self._make_pm(tmp_path)
+        pm.add_project_character("demo", "Alice", "hero", "soft")
+
+        pm.update_project_character_sheet(
+            "demo",
+            "Alice",
+            "characters/Alice.png",
+            sheet_url="https://files.example.com/agnes/Alice.png",
+        )
+
+        assert pm.get_project_character("demo", "Alice")["character_sheet"] == "characters/Alice.png"
+        assert (
+            pm.get_project_character("demo", "Alice")["character_sheet_url"]
+            == "https://files.example.com/agnes/Alice.png"
+        )
+
+    def test_update_project_character_sheet_omits_url_field_when_none(self, tmp_path):
+        pm = self._make_pm(tmp_path)
+        pm.add_project_character("demo", "Alice", "hero", "soft")
+
+        pm.update_project_character_sheet("demo", "Alice", "characters/Alice.png")
+
+        assert "character_sheet_url" not in pm.get_project_character("demo", "Alice")
+
+    def test_update_scene_sheet_writes_url(self, tmp_path):
+        pm = self._make_pm(tmp_path)
+        pm.add_scenes_batch("demo", {"客厅": {"description": "宽敞的客厅"}})
+
+        pm.update_scene_sheet(
+            "demo",
+            "客厅",
+            "scenes/客厅.png",
+            sheet_url="https://files.example.com/agnes/living_room.png",
+        )
+
+        assert pm.get_scene("demo", "客厅")["scene_sheet_url"] == "https://files.example.com/agnes/living_room.png"
+
+    def test_update_prop_sheet_writes_url(self, tmp_path):
+        pm = self._make_pm(tmp_path)
+        pm.add_props_batch("demo", {"玉佩": {"description": "古玉"}})
+
+        pm.update_prop_sheet(
+            "demo",
+            "玉佩",
+            "props/玉佩.png",
+            sheet_url="https://files.example.com/agnes/jade.png",
+        )
+
+        assert pm.get_prop("demo", "玉佩")["prop_sheet_url"] == "https://files.example.com/agnes/jade.png"
+
+    def test_update_character_sheet_script_writes_url(self, tmp_path):
+        """script 级的 update_character_sheet 也接受 sheet_url。"""
+        pm = self._make_pm(tmp_path)
+        pm.save_script(
+            "demo",
+            {
+                "episode": 1,
+                "title": "第一集",
+                "content_mode": "drama",
+                "characters": {"张三": {"description": "x"}},
+                "scenes": [],
+            },
+            "episode_1.json",
+            validate=False,
+        )
+
+        pm.update_character_sheet(
+            "demo",
+            "episode_1.json",
+            "张三",
+            "sheets/zhangsan.png",
+            sheet_url="https://files.example.com/agnes/zhangsan.png",
+        )
+        loaded = pm.load_script("demo", "episode_1.json")
+        assert loaded["characters"]["张三"]["character_sheet"] == "sheets/zhangsan.png"
+        assert loaded["characters"]["张三"]["character_sheet_url"] == "https://files.example.com/agnes/zhangsan.png"

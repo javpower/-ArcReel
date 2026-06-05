@@ -121,7 +121,7 @@ class TestMediaGenerator:
 
     def test_generate_image_success_and_failure(self, tmp_path):
         gen = _build_generator(tmp_path)
-        output_path, version = gen.generate_image(
+        output_path, version, _image_uri = gen.generate_image(
             prompt="p",
             resource_type="storyboards",
             resource_id="E1S01",

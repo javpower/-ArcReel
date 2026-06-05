@@ -119,6 +119,8 @@ class OpenAIImageBackend:
         return await self._save_and_return(response, request)
 
     async def _generate_edit(self, request: ImageGenerationRequest) -> ImageGenerationResult:
+        if self._is_agnes_i2i():
+            return await self._generate_edit_via_generations(request)
         refs = request.reference_images
         if len(refs) > _MAX_REFERENCE_IMAGES:
             logger.warning("参考图数量 %d 超过上限 %d，截断", len(refs), _MAX_REFERENCE_IMAGES)
@@ -171,6 +173,36 @@ class OpenAIImageBackend:
             stack.close()
         return await self._save_and_return(response, request)
 
+    def _is_agnes_i2i(self) -> bool:
+        return "agnes" in self._model.lower()
+
+    async def _generate_edit_via_generations(self, request):
+        refs = request.reference_images[:_MAX_REFERENCE_IMAGES]
+        # 只挑带 url 的 ref（来自上游 agnes 生成回写的 *_sheet_url）。没 url 的 ref
+        # （用户上传的 char_ref、老资产）一律忽略——曾经走 upload_to_tmpfiles 兜底，
+        # 但 tmpfiles.org 经常 500/520，500 比"少喂一张图"更糟。
+        # 全部 ref 都没 url 时降级到 T2I：prompt 本身已经描述了角色/场景，仍可生成。
+        urls = [ref.url for ref in refs if ref.url]
+        if not urls:
+            logger.info(
+                "Agnes i2i 路径无可用 url（%d 张 ref 均无 url），降级到 t2i: model=%s",
+                len(refs),
+                self._model,
+            )
+            return await self._generate_create(request)
+        # 注意：不要传 response_format。OpenAI 兼容网关（含 agnes / ark / GPT Image 族）
+        # 普遍不支持该参数，传了会 400。响应里 url / b64_json 由服务端默认决定，
+        # _save_and_return 两种格式都支持。
+        kwargs = {
+            "model": self._model,
+            "prompt": request.prompt,
+            "n": 1,
+            "extra_body": {"image": urls},
+        }
+        kwargs.update(_resolve_openai_params(request.image_size, request.aspect_ratio))
+        response = await self._client.images.generate(**kwargs)
+        return await self._save_and_return(response, request)
+
     async def _save_and_return(self, response, request: ImageGenerationRequest) -> ImageGenerationResult:
         data = getattr(response, "data", None) or []
         if not data:
@@ -178,7 +210,8 @@ class OpenAIImageBackend:
             raise RuntimeError(
                 f"OpenAI 图片生成响应 data 为空 (model={self._model})，可能触发内容安全过滤或上游服务异常"
             )
-        await save_image_from_response_item(data[0], request.output_path)
+        item = data[0]
+        await save_image_from_response_item(item, request.output_path)
         logger.info("OpenAI 图片生成完成: %s", request.output_path)
         quality = _QUALITY_MAP.get(request.image_size) if request.image_size else None
 
@@ -208,11 +241,16 @@ class OpenAIImageBackend:
                 logger.warning("OpenAI image usage 解析失败", exc_info=True)
                 img_in = img_out = txt_in = txt_out = None
 
+        # 供应商响应里有时附带公网直链（典型：OpenAI agnes 系列），存到 image_uri
+        # 供下游 backend 优先复用，省掉一次本地文件→公网的上传。
+        image_uri = getattr(item, "url", None) or None
+
         return ImageGenerationResult(
             image_path=request.output_path,
             provider=PROVIDER_OPENAI,
             model=self._model,
             quality=quality,
+            image_uri=image_uri,
             image_input_tokens=img_in,
             image_output_tokens=img_out,
             text_input_tokens=txt_in,
